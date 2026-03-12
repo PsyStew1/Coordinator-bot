@@ -1,504 +1,391 @@
-// ============================================
-// 🌀 GRAVITATIONAL BOOST COORDINATOR BOT 🌀
-// ============================================
-// v1.1 — FIXED: event names, env var handling
-// Lightweight Saturday boost session coordinator
-// ============================================
+// ============================================================
+//  GRAVITATIONAL + PBS BOOST COORDINATOR BOT v2
+//  Multi-server: GravitationaL clan + Psychedelic Block Smashers
+//  - Saturday 9PM UTC auto-reminders to BOTH servers
+//  - !boost, !ready, !go, !coord, !setup, !help in both
+//  - Separate channel routing per server
+// ============================================================
 
-const { Client, GatewayIntentBits, EmbedBuilder, Events } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const cron = require('node-cron');
 
-// ============================================
-// CONFIG — accepts BOOST_CHANNEL_ID or CHANNEL_ID
-// ============================================
-const CONFIG = {
-    BOT_TOKEN: process.env.BOT_TOKEN,
-    BOOST_CHANNEL_ID: process.env.BOOST_CHANNEL_ID || process.env.CHANNEL_ID,
-    BOOST_ROLE_ID: process.env.BOOST_ROLE_ID || null,
-    PREFIX: '!',
-    SESSION_DAY: 6,    // 0=Sun, 6=Sat
-    SESSION_HOUR: 21,
-    SESSION_MINUTE: 0,
-    REMINDERS: [60, 30, 5],
-    COSTS: {
-        CLAN_POWERUP: 12.70,
-        POWER_UP: 0.95,
-        INSTANT_BOOST: 1,
-        SUPER_INSTANT: 10,
-        POWER_BOOST_SPELL: 1,
-        ECHO_BOOST_SPELL: 1,
-        FOCUS_BOOST_SPELL: 1
-    },
-    LINKS: {
-        TOOLKIT: 'https://psystew1.github.io/miner-wars-toolkit/',
-        BOOST_TRACKER: 'https://psystew1.github.io/miner-wars-toolkit/optimal-boost-tracker.html',
-        ECHO_CALC: 'https://psystew1.github.io/miner-wars-toolkit/echo-vs-clanpower.html'
-    }
+// ── Config ────────────────────────────────────────────────────────────────────
+const GRAV_CHANNEL_ID = process.env.BOOST_CHANNEL_ID || process.env.CHANNEL_ID || '';
+const PBS_CHANNEL_ID  = process.env.PBS_BOOST_CHANNEL_ID || '';
+const GRAV_ROLE_ID    = process.env.BOOST_ROLE_ID || '';
+const PBS_ROLE_ID     = process.env.PBS_BOOST_ROLE_ID || '';
+const TOKEN           = process.env.BOT_TOKEN;
+
+if (!TOKEN) { console.error('❌  BOT_TOKEN not set!'); process.exit(1); }
+
+const CHANNELS = [
+  { id: GRAV_CHANNEL_ID, name: 'GravitationaL', roleId: GRAV_ROLE_ID, color: 0x00FF88 },
+  { id: PBS_CHANNEL_ID,  name: 'Psychedelic Block Smashers', roleId: PBS_ROLE_ID, color: 0xFF00FF },
+].filter(c => c.id); // only active if channel ID is set
+
+const PREFIX = '!';
+
+// ── State ─────────────────────────────────────────────────────────────────────
+// Per-channel session state
+const sessions = {}; // channelId → { active, mult, starter, readyMembers, startTime }
+
+function getSession(channelId) {
+  if (!sessions[channelId]) {
+    sessions[channelId] = { active: false, mult: 'x4', starter: null, readyMembers: new Set(), startTime: null };
+  }
+  return sessions[channelId];
+}
+
+// Block timing state (shared)
+const blockState = {
+  lastBlockTime: Date.now(),
+  recentIntervals: [], // last 20 block intervals in seconds
 };
 
-// ============================================
-// VALIDATE CONFIG
-// ============================================
-if (!CONFIG.BOT_TOKEN) {
-    console.error('❌ FATAL: BOT_TOKEN not set! Add it to Railway Variables.');
-    process.exit(1);
-}
-if (!CONFIG.BOOST_CHANNEL_ID) {
-    console.error('❌ FATAL: No channel ID set! Add BOOST_CHANNEL_ID or CHANNEL_ID to Railway Variables.');
-    process.exit(1);
-}
-console.log(`✅ Config loaded — Channel: ${CONFIG.BOOST_CHANNEL_ID}`);
-
-// ============================================
-// STATE
-// ============================================
-let currentWeekRsvps = new Map();
-let sessionActive = false;
-
-// ============================================
-// CLIENT SETUP
-// ============================================
+// ── Client ────────────────────────────────────────────────────────────────────
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMessageReactions
-    ]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
+  ],
 });
 
-// ============================================
-// HELPER FUNCTIONS
-// ============================================
-function getPing() {
-    return CONFIG.BOOST_ROLE_ID ? `<@&${CONFIG.BOOST_ROLE_ID}>` : '@everyone';
+// ── Helpers ───────────────────────────────────────────────────────────────────
+async function getChannel(id) {
+  if (!id) return null;
+  try { return await client.channels.fetch(id); }
+  catch (e) { console.error(`[getChannel] ${id}: ${e.message}`); return null; }
 }
 
-function getNextSession() {
-    const now = new Date();
-    const next = new Date(now);
-    const daysUntilSat = (CONFIG.SESSION_DAY - now.getUTCDay() + 7) % 7;
-    const isPast = daysUntilSat === 0 && (now.getUTCHours() > CONFIG.SESSION_HOUR || 
-        (now.getUTCHours() === CONFIG.SESSION_HOUR && now.getUTCMinutes() >= CONFIG.SESSION_MINUTE));
-    next.setUTCDate(now.getUTCDate() + (isPast ? 7 : daysUntilSat));
-    next.setUTCHours(CONFIG.SESSION_HOUR, CONFIG.SESSION_MINUTE, 0, 0);
-    return next;
+function timeAgo(seconds) {
+  if (seconds < 60)  return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s ago`;
+  return `${Math.floor(seconds / 3600)}h ago`;
 }
 
-function formatCountdown(ms) {
-    if (ms <= 0) return '**NOW!**';
-    const days = Math.floor(ms / 86400000);
-    const hours = Math.floor((ms % 86400000) / 3600000);
-    const mins = Math.floor((ms % 3600000) / 60000);
-    const parts = [];
-    if (days > 0) parts.push(`${days}d`);
-    if (hours > 0) parts.push(`${hours}h`);
-    if (mins > 0) parts.push(`${mins}m`);
-    return parts.join(' ') || '< 1m';
+function getBlockProbs() {
+  const times = blockState.recentIntervals;
+  if (!times.length) return { short: 33, normal: 34, long: 33, avg: 600 };
+  const avg   = Math.round(times.reduce((a, b) => a + b, 0) / times.length);
+  const short = Math.round(times.filter(t => t < 400).length / times.length * 100);
+  const normal = Math.round(times.filter(t => t >= 400 && t < 750).length / times.length * 100);
+  const long  = Math.round(times.filter(t => t >= 750).length / times.length * 100);
+  return { short, normal, long, avg };
 }
 
-function getRsvpSummary() {
-    if (currentWeekRsvps.size === 0) return 'No RSVPs yet — be the first!';
-    return [...currentWeekRsvps.values()]
-        .map((r, i) => `${i + 1}. **${r.username}**${r.th ? ` (${r.th} TH)` : ''}`)
-        .join('\n');
+function getTimingAdvice() {
+  const elapsed = Math.floor((Date.now() - blockState.lastBlockTime) / 1000);
+  const probs = getBlockProbs();
+
+  let phase, advice, color, emoji;
+
+  if (elapsed < 180) {
+    phase = 'Too Early'; emoji = '⏳'; color = 0x888888;
+    advice = 'Block just dropped. Wait at least 3 minutes before preparing boosts.';
+  } else if (elapsed < 400) {
+    phase = 'Warming Up'; emoji = '👀'; color = 0xFFFF00;
+    advice = 'Getting there. Monitor block timing — prepare your boosts but don\'t fire yet.';
+  } else if (elapsed < 600) {
+    phase = 'Good Window'; emoji = '✅'; color = 0x00FF88;
+    advice = 'Solid window. Start coordinating — fire boosts in the next 2–3 minutes.';
+  } else if (elapsed < 800) {
+    phase = 'PRIME WINDOW'; emoji = '💎'; color = 0xFF00FF;
+    advice = '**PRIME TIME** — Block is overdue. Fire boosts NOW for maximum value!';
+  } else {
+    phase = 'URGENT'; emoji = '🔴'; color = 0xFF0000;
+    advice = '**BLOCK HEAVILY OVERDUE** — Act immediately! Every second counts.';
+  }
+
+  return { elapsed, phase, advice, color, emoji, probs };
 }
 
-// ============================================
-// EMBED BUILDERS
-// ============================================
-function buildHelpEmbed() {
-    return new EmbedBuilder()
-        .setColor(0x8B5CF6)
-        .setTitle('🌀 Boost Coordinator — Commands')
-        .addFields(
-            {
-                name: '📋 Info',
-                value:
-                    '`!strategy` — Full boost strategy guide\n' +
-                    '`!countdown` / `!cd` — Time to next session\n' +
-                    '`!links` — Tool & tracker links\n' +
-                    '`!costs` — Current boost costs',
-                inline: true
-            },
-            {
-                name: '👥 Session',
-                value:
-                    '`!rsvp` / `!rsvp 500` — Confirm (+ optional TH)\n' +
-                    '`!who` — See who\'s confirmed\n' +
-                    '`!boost` — Manual GO signal\n' +
-                    '`!results` — Post-session wrap',
-                inline: true
-            },
-            {
-                name: '🔧 Admin',
-                value:
-                    '`!setup` — Post pinned strategy embed\n' +
-                    '`!reset` — Clear RSVPs for new week\n' +
-                    '`!test` — Test reminder embeds',
-                inline: true
-            }
-        )
-        .setFooter({ text: 'Sessions: Every Saturday 21:00 UTC' });
+// ── Strategy embeds ───────────────────────────────────────────────────────────
+function buildStrategyEmbeds(serverName, color) {
+  const e1 = new EmbedBuilder()
+    .setColor(color)
+    .setTitle(`⚡ Boost Session Strategy — ${serverName}`)
+    .setDescription('Read before each session. Coordinate to maximise blocks smashed.')
+    .addFields(
+      { name: '📅 Session Time', value: '**Every Saturday at 9:00 PM UTC**\nSet a recurring reminder now!', inline: false },
+      { name: '⏰ How to Time Your Boosts',
+        value: '1️⃣  Wait for a block to drop\n2️⃣  Count ~7–10 minutes\n3️⃣  Fire boosts just before next block\n4️⃣  Use `!coord` to see live timing advice',
+        inline: false },
+      { name: '🎯 Boost Priority Order',
+        value: '1. Clan Powerup (shared benefit)\n2. Power Up spells\n3. Echo Boost\n4. Focus Boost\n5. Instant Boost (last resort)',
+        inline: false },
+    )
+    .setFooter({ text: `${serverName} Boost Strategy v2` });
+
+  const e2 = new EmbedBuilder()
+    .setColor(color)
+    .setTitle('📋 Session Commands')
+    .addFields(
+      { name: '`!boost x4`', value: 'Start a session at x4 multiplier', inline: true },
+      { name: '`!ready`',    value: 'Mark yourself ready to fire',       inline: true },
+      { name: '`!go`',       value: 'EXECUTE — fire boosts now!',         inline: true },
+      { name: '`!coord`',    value: 'Live block timing + advice',          inline: true },
+      { name: '`!cancel`',   value: 'Cancel current session',              inline: true },
+      { name: '`!status`',   value: 'Show session status',                 inline: true },
+    )
+    .setFooter({ text: 'Use these during live sessions' });
+
+  const e3 = new EmbedBuilder()
+    .setColor(color)
+    .setTitle('🎲 Multiplier Guide')
+    .addFields(
+      { name: 'x2 — Entry Level',    value: 'Low cost, low risk. Good for newer miners.',     inline: false },
+      { name: 'x4 — Standard',       value: 'Best balance of cost vs reward. **Default.**',  inline: false },
+      { name: 'x8 — High Yield',     value: 'Strong ROI window. Coordinate with clan.',      inline: false },
+      { name: 'x16 — Elite',         value: 'High risk, high reward. Only in prime windows.', inline: false },
+      { name: 'x32+ — Legendary',    value: 'Clan-wide coordinated push only.',               inline: false },
+    )
+    .setFooter({ text: 'Higher multiplier = more blocks per round' });
+
+  return [e1, e2, e3];
 }
 
-function buildStrategyEmbed() {
-    return new EmbedBuilder()
-        .setColor(0x10B981)
-        .setTitle('⚔️ Boost Strategy Guide')
-        .setDescription(
-            '**Before the boost round starts:**\n' +
-            '1️⃣ Activate **🔵 Clan Power-Up** (12.70 GMT) — gives ALL clan members bonus\n' +
-            '2️⃣ Activate **🟠 Power-Up** (0.95 GMT) — personal damage boost\n' +
-            '3️⃣ Use **🔧 Miner Service** daily (FREE!) — don\'t forget!\n\n' +
-            '**During the boost round:**\n' +
-            '4️⃣ Watch block timing → use `!cd` to track countdown\n' +
-            '5️⃣ Activate **Instant Boost** when multiplier is right (1 GMT each)\n' +
-            '6️⃣ Use spells strategically (Power/Echo/Focus = 1 GMT each)\n\n' +
-            '**💡 Budget Tiers:**\n' +
-            '```\n' +
-            '🐟 Casual:  13.65 GMT (Clan + Power-Up)\n' +
-            '🦈 Active:  15.65 GMT (+ 2 Instants)\n' +
-            '🐋 Full:    25.65 GMT (+ Super + Spell)\n' +
-            '```'
-        )
-        .setFooter({ text: '🌀 GravitationaL | Every Saturday 21:00 UTC' });
+// ── Session reminder embed ─────────────────────────────────────────────────────
+function buildReminderEmbed(serverName, color, roleId, minutesUntil) {
+  const pingText = roleId ? `<@&${roleId}>` : '@everyone';
+  const isNow = minutesUntil === 0;
+
+  return {
+    content: isNow
+      ? `${pingText} 🚨 **BOOST SESSION IS STARTING NOW!**`
+      : `${pingText} ⏰ Boost session in **${minutesUntil} minutes!**`,
+    embed: new EmbedBuilder()
+      .setColor(isNow ? 0xFF0000 : color)
+      .setTitle(isNow ? `🔥 BOOST SESSION — ${serverName} — LIVE NOW!` : `⏰ Reminder — ${minutesUntil}min to Boost Session`)
+      .setDescription(
+        isNow
+          ? `**Everyone online? Type \`!boost x4\` to start!**\nUse \`!ready\` then \`!go\` when timed correctly.`
+          : `Get ready! Session starts at **9:00 PM UTC**.\nType \`!coord\` for live timing when it begins.`
+      )
+      .addFields(
+        { name: '📅 Schedule', value: 'Every Saturday 9:00 PM UTC', inline: true },
+        { name: '⚡ Start Command', value: '`!boost x4`', inline: true },
+      )
+      .setFooter({ text: `${serverName} • Coordinated boost for max blocks` })
+      .setTimestamp(),
+  };
 }
 
-function buildCountdownEmbed() {
-    const next = getNextSession();
-    const diff = next.getTime() - Date.now();
-    const timestamp = Math.floor(next.getTime() / 1000);
+// ── Command handlers ──────────────────────────────────────────────────────────
 
-    return new EmbedBuilder()
-        .setColor(diff < 3600000 ? 0xEF4444 : diff < 86400000 ? 0xFBBF24 : 0x10B981)
-        .setTitle('⏰ Next Boost Session')
-        .setDescription(
-            `📅 **<t:${timestamp}:F>**\n` +
-            `⏱️ **${formatCountdown(diff)}** remaining (<t:${timestamp}:R>)\n\n` +
-            `👥 **${currentWeekRsvps.size}** confirmed so far\n` +
-            `RSVP with \`!rsvp\` to join!`
-        )
-        .setFooter({ text: '🌀 GravitationaL Clan' });
+async function cmdBoost(message, args, cfgChannel) {
+  const mult = args[0] || 'x4';
+  const sess = getSession(message.channelId);
+  sess.active = true;
+  sess.mult = mult;
+  sess.starter = message.author.username;
+  sess.startTime = Date.now();
+  sess.readyMembers = new Set([message.author.id]);
+
+  const embed = new EmbedBuilder()
+    .setColor(cfgChannel?.color || 0xFF00FF)
+    .setTitle(`🚀 BOOST SESSION STARTED — ${mult.toUpperCase()}`)
+    .setDescription(`**${message.author.username}** kicked off a boost session!\n\nType \`!ready\` to join, then wait for \`!go\``)
+    .addFields(
+      { name: '⚡ Multiplier',  value: `**${mult}**`,                                 inline: true },
+      { name: '👥 Ready',       value: `**1** member`,                                 inline: true },
+      { name: '⏱ Started',     value: `<t:${Math.floor(Date.now()/1000)}:R>`,         inline: true },
+    )
+    .setFooter({ text: cfgChannel?.name || 'Boost Session' })
+    .setTimestamp();
+
+  await message.reply({ embeds: [embed] });
 }
 
-function buildLinksEmbed() {
-    return new EmbedBuilder()
-        .setColor(0x06B6D4)
-        .setTitle('🔗 Useful Links')
-        .addFields(
-            { name: '🧰 Toolkit', value: `[Open Toolkit](${CONFIG.LINKS.TOOLKIT})`, inline: true },
-            { name: '📊 Boost Tracker', value: `[Open Tracker](${CONFIG.LINKS.BOOST_TRACKER})`, inline: true },
-            { name: '🟣 Echo Calculator', value: `[Open Calculator](${CONFIG.LINKS.ECHO_CALC})`, inline: true }
-        )
-        .setFooter({ text: '🌀 GravitationaL Clan' });
+async function cmdReady(message) {
+  const sess = getSession(message.channelId);
+  if (!sess.active) return message.reply('❌ No active session. Start one with `!boost x4`');
+  sess.readyMembers.add(message.author.id);
+  await message.reply(`✅ **${message.author.username}** is ready! **${sess.readyMembers.size}** total ready.`);
 }
 
-function buildCostsEmbed() {
-    return new EmbedBuilder()
-        .setColor(0xF59E0B)
-        .setTitle('💰 Current Boost Costs')
-        .setDescription(
-            '```\n' +
-            '🔵 Clan Power-Up  = 12.70 GMT\n' +
-            '🟠 Power-Up       =  0.95 GMT\n' +
-            '🟠 Instant Boost  =  1.00 GMT (+400K)\n' +
-            '🟢 Super Instant  = 10.00 GMT (+4M)\n' +
-            '🟠 Power Boost    =  1.00 GMT (spell)\n' +
-            '🟣 Echo Boost     =  1.00 GMT (spell)\n' +
-            '🔴 Focus Boost    =  1.00 GMT (spell)\n' +
-            '```'
-        )
-        .addFields({
-            name: '💡 Minimum Budget',
-            value: '🐟 Casual: **13.65 GMT** (Clan + Power-Up)\n🦈 Active: **15.65 GMT** (+ 2 Instants)\n🐋 Full: **25.65 GMT** (+ Super + Spell)',
-            inline: false
-        })
-        .setFooter({ text: 'Prices may change — check the app!' });
+async function cmdGo(message) {
+  const sess = getSession(message.channelId);
+  if (!sess.active) return message.reply('❌ No active session.');
+  const timing = getTimingAdvice();
+
+  const embed = new EmbedBuilder()
+    .setColor(0xFF0000)
+    .setTitle('🔥🔥🔥 BOOST NOW — FIRE FIRE FIRE!')
+    .setDescription(`**ALL ${sess.readyMembers.size} PLAYERS — ACTIVATE BOOST NOW!**\n\nMultiplier: **${sess.mult}**`)
+    .addFields(
+      { name: '👥 Players Boosting', value: sess.readyMembers.size > 0 ? `${sess.readyMembers.size} members` : 'Solo', inline: true },
+      { name: '⏱ Block Status',     value: `${timing.emoji} ${timing.phase} (${timeAgo(timing.elapsed)})`, inline: true },
+    )
+    .setTimestamp();
+
+  await message.channel.send({ content: '@here', embeds: [embed] });
+  sess.active = false;
+  sess.readyMembers = new Set();
 }
 
-function buildSetupEmbed() {
-    return new EmbedBuilder()
-        .setColor(0x8B5CF6)
-        .setTitle('🌀 GravitationaL — Coordinated Boost Sessions')
-        .setDescription(
-            '**Every Saturday at 21:00 UTC** we run coordinated boosts!\n\n' +
-            '📋 Type `!strategy` for the full boost guide\n' +
-            '⏰ Type `!countdown` to see time remaining\n' +
-            '✅ Type `!rsvp` to confirm your attendance\n' +
-            '💰 Type `!costs` to see current prices\n' +
-            '🔗 Type `!links` for toolkit & trackers\n' +
-            '❓ Type `!help` for all commands'
-        )
-        .addFields(
-            { name: '🧰 Toolkit', value: `[Open](${CONFIG.LINKS.TOOLKIT})`, inline: true },
-            { name: '📊 Boost Tracker', value: `[Open](${CONFIG.LINKS.BOOST_TRACKER})`, inline: true },
-            { name: '🟣 Echo Calc', value: `[Open](${CONFIG.LINKS.ECHO_CALC})`, inline: true }
-        )
-        .setFooter({ text: '🌀 GravitationaL Clan | Use !help for all commands' });
+async function cmdCancel(message) {
+  const sess = getSession(message.channelId);
+  sess.active = false;
+  sess.readyMembers = new Set();
+  await message.reply('🛑 Boost session cancelled.');
 }
 
-function buildReminderEmbed(mins) {
-    const next = getNextSession();
-    const timestamp = Math.floor(next.getTime() / 1000);
-    const color = mins <= 5 ? 0xEF4444 : mins <= 30 ? 0xFBBF24 : 0x3B82F6;
-    const emoji = mins <= 5 ? '🚨' : mins <= 30 ? '⚠️' : '🔔';
+async function cmdStatus(message) {
+  const sess = getSession(message.channelId);
+  if (!sess.active) return message.reply('No active session. Use `!boost x4` to start.');
 
-    return new EmbedBuilder()
-        .setColor(color)
-        .setTitle(`${emoji} Boost Session in ${mins} minutes!`)
-        .setDescription(
-            `**Session starts <t:${timestamp}:R>**\n\n` +
-            '**Quick Checklist:**\n' +
-            '✅ Open Miner Wars\n' +
-            '✅ Check GMT balance (min 13.65 GMT)\n' +
-            '✅ Be ready to activate Clan Power-Up\n' +
-            `✅ RSVP: **${currentWeekRsvps.size}** confirmed\n\n` +
-            `Not confirmed yet? Type \`!rsvp\` now!`
-        )
-        .setFooter({ text: '🌀 GravitationaL | Saturday 21:00 UTC' })
-        .setTimestamp();
+  const elapsed = Math.floor((Date.now() - sess.startTime) / 1000);
+  const embed = new EmbedBuilder()
+    .setColor(0x00FFFF)
+    .setTitle('📊 Session Status')
+    .addFields(
+      { name: '⚡ Multiplier', value: sess.mult,                              inline: true },
+      { name: '👤 Started by', value: sess.starter,                           inline: true },
+      { name: '⏱ Running for', value: timeAgo(elapsed),                       inline: true },
+      { name: '👥 Ready Members', value: `${sess.readyMembers.size} members`, inline: true },
+    )
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
 }
 
-function buildGoTimeEmbed() {
-    return new EmbedBuilder()
-        .setColor(0xEF4444)
-        .setTitle('🔥🔥🔥 BOOST NOW! GO GO GO! 🔥🔥🔥')
-        .setDescription(
-            '**THE SESSION HAS STARTED!**\n\n' +
-            '1️⃣ Activate **Clan Power-Up** NOW\n' +
-            '2️⃣ Activate **Power-Up** NOW\n' +
-            '3️⃣ Watch for multiplier → boost when ready!\n\n' +
-            `👥 **${currentWeekRsvps.size}** members confirmed\n` +
-            `${getRsvpSummary()}`
-        )
-        .setFooter({ text: '🌀 GravitationaL | BOOST SESSION ACTIVE' })
-        .setTimestamp();
+async function cmdCoord(message, cfgChannel) {
+  const t = getTimingAdvice();
+  const embed = new EmbedBuilder()
+    .setColor(t.color)
+    .setTitle(`${t.emoji} Boost Coordinator — ${t.phase}`)
+    .setDescription(t.advice)
+    .addFields(
+      { name: '⏱ Elapsed',       value: timeAgo(t.elapsed),                                                 inline: true },
+      { name: '📊 Avg Block',     value: `~${Math.round(t.probs.avg)}s`,                                    inline: true },
+      { name: '⚡ Session',        value: getSession(message.channelId).active ? '🟢 Active' : '⚪ None',   inline: true },
+      { name: '🎲 Block Probabilities',
+        value: `Short (<400s): **${t.probs.short}%**  |  Normal: **${t.probs.normal}%**  |  Long (>750s): **${t.probs.long}%**`,
+        inline: false },
+    )
+    .setFooter({ text: (cfgChannel?.name || 'Boost Bot') + ' • Data from last 20 blocks' })
+    .setTimestamp();
+  await message.reply({ embeds: [embed] });
 }
 
-// ============================================
-// SCHEDULED ALERTS
-// ============================================
-function setupSchedules() {
-    // Saturday reminders at 20:00, 20:30, 20:55 UTC
-    cron.schedule('0 20 * * 6', () => sendReminder(60), { timezone: 'UTC' });
-    cron.schedule('30 20 * * 6', () => sendReminder(30), { timezone: 'UTC' });
-    cron.schedule('55 20 * * 6', () => sendReminder(5), { timezone: 'UTC' });
-
-    // GO TIME at 21:00 UTC Saturday
-    cron.schedule('0 21 * * 6', () => sendGoTime(), { timezone: 'UTC' });
-
-    // Midweek reminder: Wednesday 18:00 UTC
-    cron.schedule('0 18 * * 3', () => sendMidweekReminder(), { timezone: 'UTC' });
-
-    // Weekly RSVP reset: Sunday 00:00 UTC
-    cron.schedule('0 0 * * 0', () => {
-        currentWeekRsvps.clear();
-        console.log('🔄 Weekly RSVP list cleared');
-    }, { timezone: 'UTC' });
-
-    console.log('📅 Schedules active: Sat reminders + Wed midweek + Sun reset');
+async function cmdSetup(message, cfgChannel) {
+  const embeds = buildStrategyEmbeds(cfgChannel?.name || 'Clan', cfgChannel?.color || 0xFF00FF);
+  for (const embed of embeds) {
+    const msg = await message.channel.send({ embeds: [embed] });
+    try { await msg.pin(); } catch {}
+    await new Promise(r => setTimeout(r, 500));
+  }
+  await message.reply('✅ Strategy embeds posted and pinned!');
 }
 
-async function sendReminder(mins) {
-    try {
-        const channel = await client.channels.fetch(CONFIG.BOOST_CHANNEL_ID);
-        if (!channel) return console.error('❌ Channel not found');
-        await channel.send({ content: `${getPing()} ⏰ **${mins} minutes to boost!**`, embeds: [buildReminderEmbed(mins)] });
-        console.log(`🔔 ${mins}min reminder sent`);
-    } catch (err) {
-        console.error(`❌ Reminder failed:`, err.message);
+async function cmdHelp(message, cfgChannel) {
+  const embed = new EmbedBuilder()
+    .setColor(cfgChannel?.color || 0xFF00FF)
+    .setTitle(`⛏ Boost Coordinator — ${cfgChannel?.name || 'Clan'}`)
+    .setDescription('Commands for boost session coordination:')
+    .addFields(
+      { name: '`!boost <mult>`', value: 'Start a session (e.g. `!boost x4`, `!boost x8`)', inline: false },
+      { name: '`!ready`',        value: 'Join the active session',                           inline: false },
+      { name: '`!go`',           value: '🔥 Execute — everyone fires NOW',                  inline: false },
+      { name: '`!cancel`',       value: 'Cancel the current session',                        inline: false },
+      { name: '`!status`',       value: 'Show who\'s ready in current session',              inline: false },
+      { name: '`!coord`',        value: 'Live block timing + boost advice',                  inline: false },
+      { name: '`!setup`',        value: 'Post & pin strategy guides (officers only)',        inline: false },
+      { name: '`!help`',         value: 'This message',                                      inline: false },
+    )
+    .setFooter({ text: 'Sessions run Saturdays 9PM UTC' });
+  await message.reply({ embeds: [embed] });
+}
+
+// ── Message handler ───────────────────────────────────────────────────────────
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+  if (!message.content.startsWith(PREFIX)) return;
+
+  // Find which configured channel this came from (or allow any)
+  const cfgChannel = CHANNELS.find(c => c.id === message.channelId) || null;
+
+  const [command, ...args] = message.content.slice(PREFIX.length).trim().toLowerCase().split(/\s+/);
+  const rawArgs = message.content.slice(PREFIX.length).trim().split(/\s+/).slice(1);
+
+  console.log(`[${cfgChannel?.name || message.guild?.name || 'Unknown'}] ${message.author.username}: !${command}`);
+
+  try {
+    switch (command) {
+      case 'boost':  await cmdBoost(message, rawArgs, cfgChannel);  break;
+      case 'ready':  await cmdReady(message);                        break;
+      case 'go':     await cmdGo(message);                           break;
+      case 'cancel': await cmdCancel(message);                       break;
+      case 'status': await cmdStatus(message);                       break;
+      case 'coord':  await cmdCoord(message, cfgChannel);            break;
+      case 'setup':  await cmdSetup(message, cfgChannel);            break;
+      case 'help':   await cmdHelp(message, cfgChannel);             break;
     }
-}
-
-async function sendGoTime() {
-    try {
-        sessionActive = true;
-        const channel = await client.channels.fetch(CONFIG.BOOST_CHANNEL_ID);
-        if (!channel) return console.error('❌ Channel not found');
-        await channel.send({ content: `${getPing()} 🔥🔥🔥 **BOOST SESSION STARTED!** 🔥🔥🔥`, embeds: [buildGoTimeEmbed()] });
-        console.log('🔥 GO TIME sent!');
-        setTimeout(() => { sessionActive = false; console.log('⏹️ Session auto-ended'); }, 30 * 60 * 1000);
-    } catch (err) {
-        console.error('❌ GO TIME failed:', err.message);
-    }
-}
-
-async function sendMidweekReminder() {
-    try {
-        const channel = await client.channels.fetch(CONFIG.BOOST_CHANNEL_ID);
-        if (!channel) return console.error('❌ Channel not found');
-        const next = getNextSession();
-        const timestamp = Math.floor(next.getTime() / 1000);
-        const embed = new EmbedBuilder()
-            .setColor(0x06B6D4)
-            .setTitle('📆 Midweek Reminder')
-            .setDescription(
-                `Next boost session: **<t:${timestamp}:F>** (<t:${timestamp}:R>)\n\n` +
-                '**Prep checklist:**\n' +
-                '🔹 Check your GMT balance\n' +
-                '🔹 Budget at least **13.65 GMT** for Clan Power-Up + Power-Up\n' +
-                '🔹 Don\'t forget your daily **🔧 Miner Service** (FREE!)\n\n' +
-                `RSVP with \`!rsvp\` — **${currentWeekRsvps.size}** confirmed so far!`
-            )
-            .setFooter({ text: '🌀 GravitationaL | Saturday 21:00 UTC' })
-            .setTimestamp();
-        await channel.send({ embeds: [embed] });
-        console.log('📆 Midweek reminder sent');
-    } catch (err) {
-        console.error('❌ Midweek reminder failed:', err.message);
-    }
-}
-
-// ============================================
-// COMMAND HANDLER
-// ============================================
-client.on(Events.MessageCreate, async (msg) => {
-    // Ignore bots
-    if (msg.author.bot) return;
-    // Ignore messages without prefix
-    if (!msg.content.startsWith(CONFIG.PREFIX)) return;
-
-    // Log every command for debugging
-    console.log(`📩 Command: "${msg.content}" from ${msg.author.username} in #${msg.channel.name} (${msg.channel.id})`);
-
-    const args = msg.content.slice(CONFIG.PREFIX.length).trim().split(/\s+/);
-    const cmd = args.shift().toLowerCase();
-
-    try {
-        // ========== HELP ==========
-        if (cmd === 'help' || cmd === 'h') {
-            await msg.channel.send({ embeds: [buildHelpEmbed()] });
-        }
-
-        // ========== STRATEGY ==========
-        else if (cmd === 'strategy' || cmd === 'strat' || cmd === 's') {
-            await msg.channel.send({ embeds: [buildStrategyEmbed()] });
-        }
-
-        // ========== COUNTDOWN ==========
-        else if (cmd === 'countdown' || cmd === 'cd' || cmd === 'next') {
-            await msg.channel.send({ embeds: [buildCountdownEmbed()] });
-        }
-
-        // ========== RSVP ==========
-        else if (cmd === 'rsvp' || cmd === 'confirm' || cmd === 'in') {
-            const th = args[0] ? parseFloat(args[0]) : null;
-            currentWeekRsvps.set(msg.author.id, {
-                username: msg.author.displayName || msg.author.username,
-                th: th,
-                timestamp: Date.now()
-            });
-            const thMsg = th ? ` with **${th} TH**` : '';
-            await msg.reply(`✅ You're confirmed for Saturday${thMsg}! (${currentWeekRsvps.size} total)`);
-        }
-
-        // ========== WHO ==========
-        else if (cmd === 'who' || cmd === 'list' || cmd === 'rsvps') {
-            const embed = new EmbedBuilder()
-                .setColor(0x8B5CF6)
-                .setTitle(`👥 RSVPs — ${currentWeekRsvps.size} confirmed`)
-                .setDescription(getRsvpSummary())
-                .setFooter({ text: 'RSVP with !rsvp or !rsvp [your TH]' });
-            await msg.channel.send({ embeds: [embed] });
-        }
-
-        // ========== LINKS ==========
-        else if (cmd === 'links' || cmd === 'link' || cmd === 'tools') {
-            await msg.channel.send({ embeds: [buildLinksEmbed()] });
-        }
-
-        // ========== COSTS ==========
-        else if (cmd === 'costs' || cmd === 'cost' || cmd === 'price' || cmd === 'prices') {
-            await msg.channel.send({ embeds: [buildCostsEmbed()] });
-        }
-
-        // ========== BOOST (manual GO) ==========
-        else if (cmd === 'boost' || cmd === 'go') {
-            sessionActive = true;
-            await msg.channel.send({ content: `${getPing()} 🔥🔥🔥`, embeds: [buildGoTimeEmbed()] });
-            setTimeout(() => { sessionActive = false; }, 30 * 60 * 1000);
-        }
-
-        // ========== RESULTS ==========
-        else if (cmd === 'results' || cmd === 'result' || cmd === 'wrap') {
-            sessionActive = false;
-            const embed = new EmbedBuilder()
-                .setColor(0x10B981)
-                .setTitle('🏆 Session Complete!')
-                .setDescription(
-                    `**${currentWeekRsvps.size}** members participated this week!\n\n` +
-                    `${getRsvpSummary()}\n\n` +
-                    'Great work team! See you next Saturday 🌀'
-                )
-                .setFooter({ text: '🌀 GravitationaL' })
-                .setTimestamp();
-            await msg.channel.send({ embeds: [embed] });
-        }
-
-        // ========== SETUP (pin strategy) ==========
-        else if (cmd === 'setup') {
-            const sent = await msg.channel.send({ embeds: [buildSetupEmbed()] });
-            try {
-                await sent.pin();
-                await msg.reply('✅ Strategy embed posted and pinned!');
-            } catch (e) {
-                await msg.reply('✅ Strategy embed posted! (Could not auto-pin — pin it manually or give bot Manage Messages permission)');
-            }
-        }
-
-        // ========== RESET ==========
-        else if (cmd === 'reset') {
-            currentWeekRsvps.clear();
-            await msg.reply('🔄 RSVP list cleared for new week!');
-        }
-
-        // ========== TEST ==========
-        else if (cmd === 'test') {
-            const type = args[0] || '60';
-            if (type === 'go') {
-                await msg.channel.send({ embeds: [buildGoTimeEmbed()] });
-            } else {
-                const mins = parseInt(type) || 60;
-                await msg.channel.send({ embeds: [buildReminderEmbed(mins)] });
-            }
-            await msg.reply(`✅ Test embed sent (${type === 'go' ? 'GO TIME' : type + 'min reminder'})`);
-        }
-
-        // ========== PING (debug) ==========
-        else if (cmd === 'ping') {
-            await msg.reply(`🏓 Pong! Latency: ${client.ws.ping}ms`);
-        }
-
-    } catch (error) {
-        console.error('❌ Command error:', error);
-        msg.reply('❌ Something went wrong. Check bot logs.').catch(() => {});
-    }
+  } catch (e) {
+    console.error(`Error in !${command}:`, e.message);
+    try { await message.reply(`⚠️ Error: ${e.message}`); } catch {}
+  }
 });
 
-// ============================================
-// BOT STARTUP — using Events.ClientReady (fixed!)
-// ============================================
-client.once(Events.ClientReady, (readyClient) => {
-    console.log('');
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log(`🌀 Boost Coordinator v1.1 online!`);
-    console.log(`   Bot: ${readyClient.user.tag}`);
-    console.log(`   Channel: ${CONFIG.BOOST_CHANNEL_ID}`);
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('');
+// ── Scheduled Saturday reminders ─────────────────────────────────────────────
+// Runs at 8:00, 8:30, 8:55, and 9:00 PM UTC every Saturday
+const reminderSchedules = [
+  { cron: '0 20 * * 6',  minutes: 60 },   // 8:00 PM UTC — 60min warning
+  { cron: '30 20 * * 6', minutes: 30 },   // 8:30 PM UTC — 30min warning
+  { cron: '55 20 * * 6', minutes: 5  },   // 8:55 PM UTC — 5min warning
+  { cron: '0 21 * * 6',  minutes: 0  },   // 9:00 PM UTC — GO TIME
+];
 
-    readyClient.user.setActivity('Saturday 21:00 UTC | !help', { type: 3 });
-    setupSchedules();
+for (const schedule of reminderSchedules) {
+  cron.schedule(schedule.cron, async () => {
+    console.log(`[Scheduler] Firing ${schedule.minutes === 0 ? 'BOOST NOW' : schedule.minutes + 'min'} reminder`);
+    for (const cfgCh of CHANNELS) {
+      const ch = await getChannel(cfgCh.id);
+      if (!ch) continue;
+      const { content, embed } = buildReminderEmbed(cfgCh.name, cfgCh.color, cfgCh.roleId, schedule.minutes);
+      try {
+        await ch.send({ content, embeds: [embed] });
+        console.log(`  ✅ Reminder sent to ${cfgCh.name}`);
+      } catch (e) {
+        console.error(`  ❌ Failed to send to ${cfgCh.name}: ${e.message}`);
+      }
+    }
+  }, { timezone: 'UTC' });
+}
+
+// ── Simulated block detection (update lastBlockTime when you hook a real source) ──
+setInterval(() => {
+  const elapsed = Date.now() - blockState.lastBlockTime;
+  // Average BTC block ~10min — simulate for timing advisor
+  if (elapsed > 600000 + Math.random() * 300000) {
+    const intervalSec = Math.floor(elapsed / 1000);
+    blockState.recentIntervals.push(intervalSec);
+    if (blockState.recentIntervals.length > 20) blockState.recentIntervals.shift();
+    blockState.lastBlockTime = Date.now();
+    console.log(`[Block] Simulated block — interval: ${intervalSec}s`);
+  }
+}, 30000);
+
+// ── Ready ─────────────────────────────────────────────────────────────────────
+client.once('ready', () => {
+  console.log('================================================');
+  console.log(`  Boost Coordinator Bot v2 — MULTI-SERVER`);
+  console.log(`  Logged in as: ${client.user.tag}`);
+  console.log('================================================');
+  if (CHANNELS.length === 0) {
+    console.warn('  ⚠  No channels configured! Set BOOST_CHANNEL_ID and/or PBS_BOOST_CHANNEL_ID');
+  }
+  for (const c of CHANNELS) {
+    console.log(`  ✅  ${c.name}: #${c.id}`);
+  }
+  console.log('------------------------------------------------');
+  console.log('  📅 Saturday reminders: 60min, 30min, 5min, GO');
+  console.log('================================================');
+  client.user.setActivity('⚡ Coordinating Boosts', { type: 0 });
 });
 
-// ============================================
-// ERROR HANDLING
-// ============================================
-client.on('error', (err) => console.error('❌ Client error:', err));
-process.on('unhandledRejection', (err) => console.error('❌ Unhandled rejection:', err));
+client.on('error', e => console.error('[Error]', e.message));
+process.on('unhandledRejection', e => console.error('[Unhandled]', e?.message));
 
-// ============================================
-// LOGIN
-// ============================================
-client.login(CONFIG.BOT_TOKEN);
+client.login(TOKEN);
