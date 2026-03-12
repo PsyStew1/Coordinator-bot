@@ -1,5 +1,5 @@
 // ============================================================
-//  GRAVITATIONAL + PBS BOOST COORDINATOR BOT v2
+//  GRAVITATIONAL + PBS BOOST COORDINATOR BOT v2.0
 //  Multi-server: GravitationaL clan + Psychedelic Block Smashers
 //  - Saturday 9PM UTC auto-reminders to BOTH servers
 //  - !boost, !ready, !go, !coord, !setup, !help in both
