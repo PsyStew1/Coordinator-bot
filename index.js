@@ -292,9 +292,26 @@ async function cmdHelp(message, cfgChannel) {
       { name: '`!status`',       value: 'Show who\'s ready in current session',              inline: false },
       { name: '`!coord`',        value: 'Live block timing + boost advice',                  inline: false },
       { name: '`!setup`',        value: 'Post & pin strategy guides (officers only)',        inline: false },
-      { name: '`!help`',         value: 'This message',                                      inline: false },
+      { name: '`!links`',         value: 'Toolkit, Boost Tracker & tool links',           inline: false },
+      { name: '`!help`',          value: 'This message',                                      inline: false },
     )
     .setFooter({ text: 'Sessions run Saturdays 9PM UTC' });
+  await message.reply({ embeds: [embed] });
+}
+
+async function cmdLinks(message, cfgChannel) {
+  const embed = new EmbedBuilder()
+    .setColor(cfgChannel?.color || 0xFF00FF)
+    .setTitle(`🔗 Useful Links — ${cfgChannel?.name || 'Clan'}`)
+    .setDescription('All the tools you need for Miner Wars:')
+    .addFields(
+      { name: '🛠️ Toolkit',       value: '[Open Toolkit](https://psystew1.github.io/miner-wars-toolkit/)',                               inline: false },
+      { name: '📊 Boost Tracker', value: '[Open Boost Tracker](https://psystew1.github.io/miner-wars-toolkit/optimal-boost-tracker.html)', inline: false },
+      { name: '🟣 Echo Calc',     value: '[Open Echo Calc](https://psystew1.github.io/miner-wars-toolkit/echo-calc.html)',                 inline: false },
+      { name: '🎮 GoMining',      value: '[GoMining App](https://app.gomining.com)',                                                        inline: false },
+    )
+    .setFooter({ text: `${cfgChannel?.name || 'Clan'} • GravitationaL clan tools` })
+    .setTimestamp();
   await message.reply({ embeds: [embed] });
 }
 
@@ -321,6 +338,7 @@ client.on('messageCreate', async (message) => {
       case 'coord':  await cmdCoord(message, cfgChannel);            break;
       case 'setup':  await cmdSetup(message, cfgChannel);            break;
       case 'help':   await cmdHelp(message, cfgChannel);             break;
+      case 'links':  await cmdLinks(message, cfgChannel);            break; // works in any channel
     }
   } catch (e) {
     console.error(`Error in !${command}:`, e.message);
